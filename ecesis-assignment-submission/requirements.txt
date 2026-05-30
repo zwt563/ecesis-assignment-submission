@@ -1,0 +1,8 @@
+pandas>=2.0
+numpy>=1.24
+pyarrow>=24.0
+torch>=2.0
+meteostat>=1.6
+jupyter>=1.0
+nbformat>=5.9
+nbconvert>=7.0

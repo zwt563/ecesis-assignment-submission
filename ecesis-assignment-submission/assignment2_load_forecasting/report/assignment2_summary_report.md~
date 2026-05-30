@@ -1,0 +1,88 @@
+# Assignment 2 Summary Report
+
+## Objective
+Build a reproducible bus-level load forecasting pipeline for every 2025 bus-hour under next-day and next-month forecast settings.
+
+## Model Used
+The primary model is a GPU-trained Transformer zone forecast plus bus-share allocation pipeline. Zone load is forecast with a PyTorch TransformerEncoder trained on CUDA, separately by zone. Each feature is treated as a token so the model can learn interactions among hour, calendar, lag, and historical-average signals. Zone forecasts are then distributed to all buses using historical bus shares.
+
+## Baselines
+- Next-day baseline: same bus and hour from the previous week.
+- Next-month baseline: same bus, calendar date, and hour from the previous year.
+- Historical-average baseline: average historical load by bus, hour-ending, and weekday from 2022-2024.
+
+## Features
+- Calendar features: hour-ending, day of week, month, day of year, weekend flag, and US federal holiday flag.
+- Next-day zone features: 7-day, 14-day, 28-day, and 365-day lagged zone load plus historical zone-hour averages. The model does not use D-1 actual load under the strict `forecast_created_at = D-1 00:01:00` cutoff.
+- Next-month zone features: previous-year load, configured month-lag features sourced only from data available before forecast creation, and historical month/day/hour averages available at forecast creation time.
+- Bus allocation features: dynamic weighted bus shares. Next-day uses D-7/D-14/D-28 historical shares; next-month uses a previous-year same-season window at -14/-7/0/+7/+14 days. Missing shares fall back to 2024 bus-hour average share.
+- Historical bus `pd` imputation: only partial-missing buses with at least one nonzero historical load are imputed. The fallback order is same bus + same HE + nearby historical days, same bus + same HE + same day-of-week mean, same bus + same HE mean, same zone + same HE + same day-of-week average multiplied by historical bus share, then 0.
+- All-missing bus treatment: all-missing buses are not used to estimate bus shares; if a zone/hour has no usable share at all, the bus shares remain 0 rather than being averaged across buses.
+
+## Leakage Control
+- The next-day zone model is trained on 2022-2024 and uses rolling lag features available before `forecast_created_at`; for target day D, this excludes D-1 actual load under the strict 00:01 cutoff.
+- The next-month zone model is refit for each target month using rows before that forecast creation date; month-lag features are built from the same available-history cutoff, so unavailable prior-month actuals remain missing rather than being pulled from the future.
+- Historical bus imputation uses prior-year non-null observations only: 2024 source rows use 2022-2023 history, and 2025 source rows use 2022-2024 history. Target-year `pd` is never used as a feature.
+- 2025 target-day bus `pd` is used only as actuals for evaluation, not as a model feature.
+- Missing bus `pd` values are filled with zero for modeling and scoring, as requested, so every 2025 bus row receives a forecast and participates in metrics.
+- Interpretation caveat: a bus that is consistently zero or consistently missing may be a non-load bus, but intermittent missing `pd` values may represent either true zero load or unavailable measurements.
+
+## Data Coverage Note
+The provided 2025 zone target data is missing 252 date/hour/zone combinations across 5 dates (2025-03-09, 2025-05-01, 2025-08-18, 2025-09-22, 2025-12-04). Forecast files therefore cover every provided 2025 bus target row; missing source target rows cannot be evaluated without inventing a bus roster and actual load.
+
+## Metrics
+- Forecast rows per task: 88,024,734
+- Next-day rows from 2025 all-missing buses: 42,929,938
+- Next-month rows from 2025 all-missing buses: 42,929,938
+- Next-day rows with no 2022-2024 nonzero bus history: 51,407,409
+- Next-month rows with no 2022-2024 nonzero bus history: 51,407,409
+- Next-day rows in zero-share zone/hour groups: 2,116
+- Next-month rows in zero-share zone/hour groups: 2,116
+- Next-day Transformer bus-level (zone_share_transformer_next_day): MAE=0.9594, RMSE=5.0282, WMAPE=17.2500%
+- Next-day baseline bus-level: MAE=0.9045, RMSE=5.2036, WMAPE=16.2627%
+- Next-day historical-average baseline bus-level: MAE=1.9306, RMSE=9.2833, WMAPE=34.7112%
+- Next-day Transformer zone-level (zone_share_transformer_next_day): MAE=711.1957, RMSE=1291.8195, WMAPE=10.2080%
+- Next-day baseline zone-level: MAE=787.3225, RMSE=1449.3483, WMAPE=11.3006%
+- Next-day historical-average baseline zone-level: MAE=1197.8391, RMSE=1768.3210, WMAPE=17.1929%
+- Next-month Transformer bus-level (zone_share_transformer_next_month): MAE=1.8250, RMSE=9.1771, WMAPE=32.8121%
+- Next-month baseline bus-level: MAE=1.8315, RMSE=9.3310, WMAPE=32.9294%
+- Next-month historical-average baseline bus-level: MAE=1.9306, RMSE=9.2833, WMAPE=34.7112%
+- Next-month Transformer zone-level (zone_share_transformer_next_month): MAE=745.1698, RMSE=1317.0676, WMAPE=10.6956%
+- Next-month baseline zone-level: MAE=798.3625, RMSE=1330.7820, WMAPE=11.4591%
+- Next-month historical-average baseline zone-level: MAE=1197.8391, RMSE=1768.3210, WMAPE=17.1929%
+
+## Where It Works Well
+The pipeline is strongest for stable load buses and stable zone shapes, because previous-week and previous-year bus shares preserve local distribution patterns while the zone model captures system-level seasonality.
+
+## Where It Performs Poorly
+The model is weaker for newly appearing buses, buses with structural changes, buses with intermittent missing measurements, and rare calendar/weather conditions because it has no weather data and must fall back to historical share averages.
+
+## Improvements With More Time
+- Add weather forecasts and weather normals by zone.
+- Train direct bus-level models for high-load buses and keep share allocation for low-load or sparse buses.
+- Add explicit treatment for topology changes and bus additions/removals.
+- Tune model hyperparameters with rolling-origin validation.
+
+## Insights
+- Zone-level modeling is computationally practical for this dataset because the zone table is small while the bus table has hundreds of millions of rows.
+- The Transformer is used as the primary neural model because the assignment does not require MLP and because attention over feature tokens gives a stronger explanation for feature interaction modeling.
+- Bus-share allocation keeps the full bus output schema tractable and preserves exact row coverage.
+- Filling missing bus `pd` with zero allows all bus rows to be scored, but intermittent missing values should not be over-interpreted as proof that a node has no load.
+- Historical imputation can increase bus-level error when target actuals are still scored as zero for missing `pd`; it is mainly a robustness improvement for partial-missing history rather than a guaranteed metric improvement under the zero-actual scoring convention.
+
+## Conclusions
+This solution produces full-year 2025 forecasts for both required horizons, compares them with simple baselines, and reports both bus-level and zone-level accuracy without using target-day future load as a feature.
+
+## Deliverables
+- `assignment2_next_day_forecast_2025.parquet`
+- `assignment2_next_month_forecast_2025.parquet`
+- `assignment2_next_day_forecast_sample.csv`
+- `assignment2_next_month_forecast_sample.csv`
+- `assignment2_metrics.csv`
+- `assignment2_bus_pd_missingness_by_year.csv`
+- `assignment2_missing_bus_forecast_audit.csv`
+- `assignment2_summary_report.md`
+- `assignment2_ai_usage_log.md`
+- `assignment2_load_forecasting.ipynb`
+- `assignment2_method2_zone_share_transformer.py`
+- Runtime: 0.0 minutes
