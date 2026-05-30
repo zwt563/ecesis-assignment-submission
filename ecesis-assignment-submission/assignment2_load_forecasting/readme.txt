@@ -1,0 +1,1 @@
+run nodebook in folder "notebook/assignment2_load_forecasting.ipynb"
